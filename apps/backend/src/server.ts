@@ -1,20 +1,22 @@
 import express from "express";
 import cors from "cors";
 import { pool } from "./db";
-import { analyzeAndOptimizeSQL } from "../../../services/optimizer/index"; 
+import { analyzeAndOptimizeSQL } from "../../../services/optimizer/index";
 
 const app = express();
 
 app.use(cors());
 app.use(express.json());
 
+// 1. API Healthcheck - Trạng thái hệ thống & PostgreSQL
 app.get("/api/health", async (_req, res) => {
   try {
     const dbRes = await pool.query("SELECT NOW() as current_time;");
     res.json({
       success: true,
       status: "UP",
-      message: "Backend & PostgreSQL đang kết nối bình thường",
+      message: "PostgreSQL 16 – Đã kết nối",
+      datasetInfo: "e_commerce_db (750,000 dòng)",
       dbTime: dbRes.rows[0].current_time,
     });
   } catch (error: any) {
@@ -27,6 +29,7 @@ app.get("/api/health", async (_req, res) => {
   }
 });
 
+// 2. API Phân Tích & Tối Ưu Truy Vấn SQL
 app.post("/api/optimize", async (req, res) => {
   const { sql } = req.body;
   if (!sql || typeof sql !== "string") {
@@ -46,7 +49,26 @@ app.post("/api/optimize", async (req, res) => {
   }
 });
 
-const PORT = 3000;
+// 3. API Trả về Danh sách Câu SQL Mẫu cho Frontend Dropdown
+app.get("/api/samples", (_req, res) => {
+  res.json({
+    success: true,
+    data: [
+      {
+        id: "sample-1",
+        title: "Nghẽn JOIN do thiếu Index (Bảng orders & customers)",
+        sql: "SELECT * FROM orders o JOIN customers c ON o.customer_id = c.id WHERE o.status = 'completed';",
+      },
+      {
+        id: "sample-2",
+        title: "Nghẽn Lớn: Quét Sequential Scan trên 500,000 dòng order_items",
+        sql: "SELECT * FROM order_items oi JOIN orders o ON oi.order_id = o.id WHERE oi.unit_price > 50;",
+      }
+    ]
+  });
+});
+
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Backend Server running at http://localhost:${PORT}`);
+  console.log(`🚀 Backend API Server running at http://localhost:${PORT}`);
 });
