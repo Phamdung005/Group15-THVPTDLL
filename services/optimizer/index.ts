@@ -1,3 +1,8 @@
+import { pool } from "../../apps/backend/src/db";
+import { executePlanAnalyze } from "./analyzer/plan-analyzer";
+import { checkSelectStarRule } from "./rules/select-star.rule";
+import { checkMissingIndexRule } from "./rules/missing-index.rule";
+
 export interface BottleneckItem {
   id: string;
   severity: "high" | "medium" | "low";
@@ -65,72 +70,81 @@ export interface OptimizationResponse {
 }
 
 export async function analyzeAndOptimizeSQL(sql: string): Promise<OptimizationResponse> {
-  const isSelectAll = /SELECT\s+\*/i.test(sql);
-  const hasJoinWithoutIndex = /JOIN/i.test(sql) && !/INDEX/i.test(sql);
+  // 1. Chạy EXPLAIN ANALYZE trên câu lệnh gốc (TRƯỚC TỐI ƯU)
+  const beforeMetrics = await executePlanAnalyze(sql);
 
+  // 2. Chạy Rule 1: Kiểm tra SELECT *
+  const selectStarRes = checkSelectStarRule(sql);
+
+  // 3. Chạy Rule 2: Kiểm tra Sequential Scan / Thiếu Index
+  const missingIndexRes = checkMissingIndexRule(beforeMetrics.seqScanTables);
+
+  // 4. Tổng hợp Bottlenecks & Recommendations
   const bottlenecks: BottleneckItem[] = [];
   const recommendations: RecommendationItem[] = [];
   const appliedRules: string[] = [];
 
-  if (isSelectAll) {
-    bottlenecks.push({
-      id: "bot-1",
-      severity: "high",
-      title: "Phát hiện 'SELECT *'",
-      description: "Truy vấn đọc toàn bộ các cột trong bảng, gây lãng phí dung lượng Shared Buffers và I/O đĩa.",
-      suggestedFix: "Chỉ chọn các cột thực sự cần thiết trong danh sách SELECT.",
-    });
-    recommendations.push({
-      id: "rec-1",
-      type: "rewrite",
-      action: "Tối ưu danh sách cột SELECT",
-      explanation: "Đã thay thế 'SELECT *' bằng các cột cụ thể 'o.order_id, c.customer_name, o.created_at'.",
-    });
+  if (selectStarRes.bottleneck) {
+    bottlenecks.push(selectStarRes.bottleneck);
+    if (selectStarRes.recommendation) recommendations.push(selectStarRes.recommendation);
     appliedRules.push("SELECT Column Pushdown");
   }
 
-  if (hasJoinWithoutIndex) {
-    bottlenecks.push({
-      id: "bot-2",
-      severity: "high",
-      title: "Sequential Scan trên bảng `orders` (5.2M dòng)",
-      description: "Phát hiện thuật toán Nested Loop/Hash Join thực hiện Sequential Scan trên kho dữ liệu 5.2 triệu hàng do thiếu Index ở khóa ngoại `customer_id`.",
-      table: "orders",
-      suggestedFix: "Tạo B-Tree Index cho khóa ngoại `orders(customer_id)`.",
-    });
-    recommendations.push({
-      id: "rec-2",
-      type: "index",
-      action: "Tạo B-Tree Index cho bảng `orders`",
-      sqlCommand: "CREATE INDEX idx_orders_customer_id ON orders(customer_id);",
-      explanation: "Chuyển đổi quét toàn bộ bảng (Sequential Scan) thành Index Scan, giảm thời gian tìm kiếm từ O(N) xuống O(log N).",
-    });
+  if (missingIndexRes.bottlenecks.length > 0) {
+    bottlenecks.push(...missingIndexRes.bottlenecks);
+    recommendations.push(...missingIndexRes.recommendations);
     appliedRules.push("Index Pushdown Recommendation");
   }
 
-  const defaultSuggested = isSelectAll
-    ? sql.replace(/SELECT\s+\*/i, "SELECT o.order_id, c.customer_name, o.created_at")
-    : sql;
+  // Nếu có gợi ý tạo Index, tạm thời tạo Index trong PostgreSQL để đo Benchmark SAU TỐI ƯU
+  if (missingIndexRes.suggestedIndexes.length > 0) {
+    for (const ddl of missingIndexRes.suggestedIndexes) {
+      try {
+        const safeDdl = ddl.replace("CREATE INDEX", "CREATE INDEX IF NOT EXISTS");
+        await pool.query(safeDdl);
+      } catch (err: any) {
+        console.warn("Lỗi khi tạm tạo Index benchmark:", err.message);
+      }
+    }
+  }
 
+  // 5. Xác định câu SQL đề xuất mới
+  const suggestedSql = selectStarRes.rewrittenSql || sql;
+
+  // 6. Chạy EXPLAIN ANALYZE trên câu lệnh đề xuất (SAU TỐI ƯU THẬT 100%)
+  const afterMetrics = await executePlanAnalyze(suggestedSql);
+
+  // 7. Tính phần trăm cải thiện
+  const execTimeDiff = beforeMetrics.executionTimeMs - afterMetrics.executionTimeMs;
+  const improvementPercent = beforeMetrics.executionTimeMs > 0
+    ? Math.max(0, Number(((execTimeDiff / beforeMetrics.executionTimeMs) * 100).toFixed(1)))
+    : 0;
+
+  const costDiff = beforeMetrics.totalCost - afterMetrics.totalCost;
+  const reductionPercent = beforeMetrics.totalCost > 0
+    ? Math.max(0, Number(((costDiff / beforeMetrics.totalCost) * 100).toFixed(1)))
+    : 0;
+
+  // 8. Đóng gói danh sách Candidate Queries
   const candidates: CandidateQuery[] = [
     {
-      id: "cand-a",
-      name: "Phương án A (Chỉ tạo Index)",
-      description: "Giữ nguyên cú pháp SQL gốc, tạo thêm B-Tree Index cho khóa ngoại.",
+      id: "cand-orig",
+      name: "Câu SQL Gốc (Chưa Tối Ưu)",
+      description: "Câu truy vấn ban đầu do người dùng nhập vào.",
       sql: sql,
       isBest: false,
-      executionTimeMs: 420,
-      queryCost: 1200,
+      executionTimeMs: beforeMetrics.executionTimeMs,
+      queryCost: beforeMetrics.totalCost,
     },
     {
-      id: "cand-b",
-      name: "Phương án B (Viết lại SQL + Tạo Index) - TỐI ƯU NHẤT",
-      description: "Chuyển SELECT * thành danh sách cột cụ thể kết hợp tạo B-Tree Index.",
-      sql: defaultSuggested,
+      id: "cand-best",
+      name: "Phương án Tối Ưu Nhất (Viết lại SQL + Tạo Index)",
+      description: "Phương án áp dụng toàn bộ các luật tối ưu và Index Scan.",
+      sql: suggestedSql,
       isBest: true,
-      executionTimeMs: 180,
-      queryCost: 610.2,
-    },
+      executionTimeMs: afterMetrics.executionTimeMs,
+      queryCost: afterMetrics.totalCost,
+    }
   ];
 
   return {
@@ -138,18 +152,18 @@ export async function analyzeAndOptimizeSQL(sql: string): Promise<OptimizationRe
     timestamp: new Date().toISOString(),
     dataset: {
       name: "e_commerce_db",
-      totalRows: 5200000,
+      totalRows: 750000,
     },
     originalQuery: sql,
-    suggestedQuery: defaultSuggested,
+    suggestedQuery: suggestedSql,
     candidates: candidates,
-    appliedRules: appliedRules.length > 0 ? appliedRules : ["Query Standard Check"],
+    appliedRules: appliedRules.length > 0 ? appliedRules : ["Standard Plan Checking"],
     bottlenecks: bottlenecks.length > 0 ? bottlenecks : [
       {
         id: "bot-0",
         severity: "low",
         title: "Chưa phát hiện điểm nghẽn nghiêm trọng",
-        description: "Truy vấn có vẻ ổn định hoặc đã có index tối ưu.",
+        description: "Truy vấn có vẻ ổn định hoặc đã có Index phù hợp.",
       }
     ],
     recommendations: recommendations.length > 0 ? recommendations : [
@@ -162,24 +176,24 @@ export async function analyzeAndOptimizeSQL(sql: string): Promise<OptimizationRe
     ],
     metrics: {
       executionTime: {
-        beforeMs: 1250,
-        afterMs: 180,
-        improvementPercent: 85.6,
+        beforeMs: Number(beforeMetrics.executionTimeMs.toFixed(2)),
+        afterMs: Number(afterMetrics.executionTimeMs.toFixed(2)),
+        improvementPercent: improvementPercent,
       },
       queryCost: {
-        before: 4520.5,
-        after: 610.2,
-        reductionPercent: 86.5,
+        before: Number(beforeMetrics.totalCost.toFixed(2)),
+        after: Number(afterMetrics.totalCost.toFixed(2)),
+        reductionPercent: reductionPercent,
       },
       bufferReads: {
-        sharedHitsBefore: 120,
-        sharedHitsAfter: 14500,
-        sharedReadsBefore: 8500,
-        sharedReadsAfter: 12,
+        sharedHitsBefore: beforeMetrics.sharedHits,
+        sharedHitsAfter: afterMetrics.sharedHits,
+        sharedReadsBefore: beforeMetrics.sharedReads,
+        sharedReadsAfter: afterMetrics.sharedReads,
       },
       planningTime: {
-        beforeMs: 2.1,
-        afterMs: 0.8,
+        beforeMs: Number(beforeMetrics.planningTimeMs.toFixed(2)),
+        afterMs: Number(afterMetrics.planningTimeMs.toFixed(2)),
       },
     },
   };
