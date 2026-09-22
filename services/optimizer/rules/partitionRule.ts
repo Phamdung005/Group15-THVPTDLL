@@ -16,7 +16,7 @@ export function checkPartitionRule(totalRows: number, tablename: string): {
       recommendation: {
         id: "rec-partition",
         type: "config",
-        action: `Phân vùng bảng \`${tablename}\` theo RANGE (created_at)`,
+        action: `Phân vùng bảng \`${tablename}\` theo RANGE (cột thời gian hoặc khóa chính)`,
         explanation: "Giúp PostgreSQL chỉ quét các phân vùng dữ liệu cần thiết (Partition Pruning).",
       },
     };

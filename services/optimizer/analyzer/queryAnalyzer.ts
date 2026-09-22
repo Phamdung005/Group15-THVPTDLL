@@ -1,4 +1,4 @@
-import { ParsedSQL } from "../parser/sql-parser";
+import { ParsedSQL } from "../parser/sqlParser";
 
 export interface QueryComplexity {
   tableCount: number;

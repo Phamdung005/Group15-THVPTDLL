@@ -1,46 +1,57 @@
-export interface HealthScoreResult {
-  score: number; // 0 to 100
-  grade: "A" | "B" | "C" | "D" | "F";
-  summary: string;
+import { BenchmarkMetrics } from "../analyzer/planAnalyzer";
+import { OptimizationCandidate } from "../optimizer/candidateGenerator";
+
+export interface CandidateScore {
+  candidateId: string;
+  timeImprovementPercent: number;
+  readReductionPercent: number;
+  costReductionPercent: number;
+  totalScore: number;
 }
 
-export function calculateQueryHealthScore(
-  executionTimeMs: number,
-  queryCost: number,
-  sharedReads: number
-): HealthScoreResult {
-  let penalty = 0;
+/**
+ * Chuẩn hóa các chỉ số đo đạc (Normalized Metrics) và tính điểm tổng hợp cho từng Candidate.
+ * Công thức:
+ * Score = (0.5 * % Giảm Thời Gian) + (0.3 * % Giảm Đọc Đĩa) + (0.2 * % Giảm Cost) - (Phạt overhead số lượng Index)
+ */
+export function calculateCandidateScore(
+  baseline: BenchmarkMetrics,
+  candidateBenchmark: BenchmarkMetrics,
+  candidate: OptimizationCandidate
+): CandidateScore {
+  const baseTime = Math.max(0.01, baseline.executionTimeMs);
+  const baseReads = Math.max(1, baseline.sharedReadBlocks);
+  const baseCost = Math.max(1, baseline.totalCost);
 
-  // Execution Time Penalties
-  if (executionTimeMs > 2000) penalty += 40;
-  else if (executionTimeMs > 500) penalty += 25;
-  else if (executionTimeMs > 100) penalty += 10;
+  // 1. Chuẩn hóa tỷ lệ cải thiện (0% đến 100%)
+  const timeDiff = Math.max(0, baseTime - candidateBenchmark.executionTimeMs);
+  const timeImprovementPercent = Number(((timeDiff / baseTime) * 100).toFixed(1));
 
-  // Query Cost Penalties
-  if (queryCost > 10000) penalty += 30;
-  else if (queryCost > 2000) penalty += 20;
-  else if (queryCost > 500) penalty += 10;
+  const readDiff = Math.max(0, baseReads - candidateBenchmark.sharedReadBlocks);
+  const readReductionPercent = Number(((readDiff / baseReads) * 100).toFixed(1));
 
-  // Shared Disk Reads Penalties (High I/O is bad)
-  if (sharedReads > 5000) penalty += 30;
-  else if (sharedReads > 1000) penalty += 20;
-  else if (sharedReads > 100) penalty += 10;
+  const costDiff = Math.max(0, baseCost - candidateBenchmark.totalCost);
+  const costReductionPercent = Number(((costDiff / baseCost) * 100).toFixed(1));
 
-  const score = Math.max(0, Math.min(100, 100 - penalty));
+  // 2. Chi phí overhead ghi khi tạo thêm Index (tránh tạo index vô tội vạ)
+  const indexCount = candidate.changes.filter((c) => c.type === "CREATE_INDEX").length;
+  const indexOverheadPenalty = indexCount * 2.0;
 
-  let grade: "A" | "B" | "C" | "D" | "F" = "A";
-  let summary = "Truy vấn đạt hiệu năng rất tốt.";
+  // 3. Tổng điểm chuẩn hóa
+  const totalScore = Number(
+    (
+      0.5 * timeImprovementPercent +
+      0.3 * readReductionPercent +
+      0.2 * costReductionPercent -
+      indexOverheadPenalty
+    ).toFixed(2)
+  );
 
-  if (score < 50) {
-    grade = "F";
-    summary = "Truy vấn có điểm nghẽn nghiêm trọng, cần tối ưu ngay.";
-  } else if (score < 70) {
-    grade = "C";
-    summary = "Truy vấn có thể nâng cấp hiệu năng bằng cách thêm Index.";
-  } else if (score < 85) {
-    grade = "B";
-    summary = "Truy vấn hoạt động khá ổn định.";
-  }
-
-  return { score, grade, summary };
+  return {
+    candidateId: candidate.id,
+    timeImprovementPercent,
+    readReductionPercent,
+    costReductionPercent,
+    totalScore: Math.max(0, totalScore),
+  };
 }

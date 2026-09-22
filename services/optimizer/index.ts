@@ -1,59 +1,37 @@
 import { pool } from "../../apps/backend/src/db";
-import { executePlanAnalyze } from "./analyzer/plan-analyzer";
-import { checkSelectStarRule } from "./rules/select-star.rule";
-import { checkMissingIndexRule } from "./rules/missing-index.rule";
+import { getEstimatedPlan, PlanNode, BenchmarkMetrics } from "./analyzer/planAnalyzer";
+import { analyzeColumnRoles, AnalyzedColumn } from "./analyzer/columnRoleAnalyzer";
+import { isIndexCovered } from "./analyzer/schemaAnalyzer";
+import { checkSelectStarRule } from "./rules/selectStarRule";
+import { checkFunctionOnColumnRule } from "./rules/functionColumnRule";
+import {
+  buildOptimizationCandidates,
+  OptimizationCandidate,
+  ProposedIndex,
+} from "./optimizer/candidateGenerator";
+import { validateCandidate } from "./optimizer/candidateValidator";
+import { benchmarkCandidateIsolated } from "./benchmark/executor";
+import { compareCandidates, ComparisonResult } from "./benchmark/comparator";
+import { applyCandidateAction, rollbackLatestAction } from "./history/historyService";
 
 export interface BottleneckItem {
   id: string;
-  severity: "high" | "medium" | "low";
+  severity: "low" | "medium" | "high";
   title: string;
   description: string;
-  table?: string;
   suggestedFix?: string;
+  table?: string;
 }
 
 export interface RecommendationItem {
   id: string;
-  type: "index" | "rewrite" | "config";
+  type: string;
   action: string;
   sqlCommand?: string;
   explanation: string;
 }
 
-export interface CandidateQuery {
-  id: string;
-  name: string;
-  description: string;
-  sql: string;
-  isBest: boolean;
-  executionTimeMs: number;
-  queryCost: number;
-}
-
-export interface PerformanceMetrics {
-  executionTime: {
-    beforeMs: number;
-    afterMs: number;
-    improvementPercent: number;
-  };
-  queryCost: {
-    before: number;
-    after: number;
-    reductionPercent: number;
-  };
-  bufferReads: {
-    sharedHitsBefore: number;
-    sharedHitsAfter: number;
-    sharedReadsBefore: number;
-    sharedReadsAfter: number;
-  };
-  planningTime: {
-    beforeMs: number;
-    afterMs: number;
-  };
-}
-
-export interface OptimizationResponse {
+export interface OptimizationResponseDTO {
   queryId: string;
   timestamp: string;
   dataset: {
@@ -61,140 +39,216 @@ export interface OptimizationResponse {
     totalRows: number;
   };
   originalQuery: string;
-  suggestedQuery: string;
-  candidates: CandidateQuery[];
-  appliedRules: string[];
-  bottlenecks: BottleneckItem[];
-  recommendations: RecommendationItem[];
-  metrics: PerformanceMetrics;
+  analysis: {
+    columnRoles: AnalyzedColumn[];
+    tables: string[];
+    hasAggregation: boolean;
+    hasSort: boolean;
+  };
+  planTree: PlanNode;
+  candidates: OptimizationCandidate[];
+  comparison: ComparisonResult;
+  bestCandidate: OptimizationCandidate;
+  metrics: {
+    baseline: BenchmarkMetrics;
+    best: BenchmarkMetrics;
+    improvementPercent: number;
+    readReductionPercent: number;
+    costReductionPercent: number;
+  };
 }
 
-export async function analyzeAndOptimizeSQL(sql: string): Promise<OptimizationResponse> {
-  // 1. Chạy EXPLAIN ANALYZE trên câu lệnh gốc (TRƯỚC TỐI ƯU)
-  const beforeMetrics = await executePlanAnalyze(sql);
+export type OptimizationResponse = OptimizationResponseDTO;
 
-  // 2. Chạy Rule 1: Kiểm tra SELECT *
-  const selectStarRes = checkSelectStarRule(sql);
+/**
+ * MASTER ORCHESTRATOR: Plan-Driven Optimization Advisor & Candidate Optimizer
+ */
+export async function analyzeAndOptimizeSQL(sql: string): Promise<OptimizationResponseDTO> {
+  const cleanSql = sql.trim();
 
-  // 3. Chạy Rule 2: Kiểm tra Sequential Scan / Thiếu Index
-  const missingIndexRes = checkMissingIndexRule(beforeMetrics.seqScanTables);
-
-  // 4. Tổng hợp Bottlenecks & Recommendations
-  const bottlenecks: BottleneckItem[] = [];
-  const recommendations: RecommendationItem[] = [];
-  const appliedRules: string[] = [];
-
-  if (selectStarRes.bottleneck) {
-    bottlenecks.push(selectStarRes.bottleneck);
-    if (selectStarRes.recommendation) recommendations.push(selectStarRes.recommendation);
-    appliedRules.push("SELECT Column Pushdown");
+  // 1. STAGE: SECURITY CHECK (Chỉ cho phép SELECT / EXPLAIN, chặn toàn bộ lệnh ghi DML/DDL)
+  if (/^\s*(DROP|DELETE|TRUNCATE|UPDATE|INSERT|ALTER|CREATE)\b/i.test(cleanSql)) {
+    const err: any = new Error("Hệ thống chỉ hỗ trợ phân tích các truy vấn đọc (SELECT / EXPLAIN). Các lệnh DDL/DML ghi bị từ chối vì lý do an toàn.");
+    err.stage = "SECURITY";
+    throw err;
   }
 
-  if (missingIndexRes.bottlenecks.length > 0) {
-    bottlenecks.push(...missingIndexRes.bottlenecks);
-    recommendations.push(...missingIndexRes.recommendations);
-    appliedRules.push("Index Pushdown Recommendation");
+  // 2. STAGE: PARSER CHECK (Kiểm tra cú pháp SQL cơ bản)
+  if (/\bWHERE\s*;/i.test(cleanSql) || /\bFROM\s*;/i.test(cleanSql) || /;\s*;/i.test(cleanSql)) {
+    const err: any = new Error("Cú pháp SQL không hợp lệ. Vui lòng kiểm tra lại vị trí dấu chấm phẩy hoặc mệnh đề WHERE.");
+    err.stage = "PARSER";
+    throw err;
   }
 
-  // Nếu có gợi ý tạo Index, tạm thời tạo Index trong PostgreSQL để đo Benchmark SAU TỐI ƯU
-  if (missingIndexRes.suggestedIndexes.length > 0) {
-    for (const ddl of missingIndexRes.suggestedIndexes) {
-      try {
-        const safeDdl = ddl.replace("CREATE INDEX", "CREATE INDEX IF NOT EXISTS");
-        await pool.query(safeDdl);
-      } catch (err: any) {
-        console.warn("Lỗi khi tạm tạo Index benchmark:", err.message);
+  // 3. STAGE: PURE EXPLAIN (FORMAT JSON) - AN TOÀN TUYỆT ĐỐI, KHÔNG CHẠY QUERY THẬT
+  let estimatedPlanResult;
+  try {
+    estimatedPlanResult = await getEstimatedPlan(cleanSql);
+  } catch (err: any) {
+    if (err.message && err.message.includes("does not exist")) {
+      const schemaErr: any = new Error(`Bảng hoặc quan hệ trong truy vấn không tồn tại trong CSDL (${err.message})`);
+      schemaErr.stage = "SCHEMA";
+      throw schemaErr;
+    }
+    throw err;
+  }
+
+  // 4. STAGE: COLUMN ROLES & QUERY STRUCTURE
+  const queryStructure = analyzeColumnRoles(cleanSql);
+
+  // 5. STAGE: QUERY REWRITE RULES (Projection Pruning & Range Rewrite)
+  const selectStarRes = checkSelectStarRule(cleanSql);
+  const funcRes = checkFunctionOnColumnRule(cleanSql);
+
+  let rewrittenSql: string | undefined = undefined;
+  let rewriteReason: string | undefined = undefined;
+
+  if (funcRes.rewrittenSql) {
+    rewrittenSql = funcRes.rewrittenSql;
+    rewriteReason = "Viết lại điều kiện hàm thời gian thành so sánh phạm vi hằng số (Range Predicate)";
+  }
+  if (selectStarRes.rewrittenSql) {
+    const baseToRewrite = rewrittenSql || cleanSql;
+    const starResult = checkSelectStarRule(baseToRewrite);
+    if (starResult.rewrittenSql) {
+      rewrittenSql = starResult.rewrittenSql;
+      rewriteReason = rewriteReason
+        ? `${rewriteReason} + Thu gọn danh sách cột chiếu (Column Pruning)`
+        : "Thu gọn danh sách cột chiếu (Column Pruning)";
+    }
+  }
+
+  // 6. STAGE: PROPOSED INDEXES DỰA TRÊN CATALOG CHECK & PLAN NODES
+  // Chỉ xét các bảng có node Seq Scan trong Plan gốc
+  const singleIndexes: ProposedIndex[] = [];
+  const compositeIndexes: ProposedIndex[] = [];
+
+  for (const table of estimatedPlanResult.seqScanTables) {
+    // Lấy các cột lọc và nối của bảng này (Loại trừ các cột AGGREGATE)
+    const joinCols = queryStructure.columns
+      .filter((c) => c.tableName === table && c.role === "JOIN")
+      .map((c) => c.columnName);
+
+    const equalCols = queryStructure.columns
+      .filter((c) => c.tableName === table && c.role === "FILTER_EQUAL")
+      .map((c) => c.columnName);
+
+    const rangeCols = queryStructure.columns
+      .filter((c) => c.tableName === table && c.role === "FILTER_RANGE")
+      .map((c) => c.columnName);
+
+    // 6a. Kiểm tra đề xuất Single Index (Ưu tiên cột JOIN hoặc cột lọc bằng)
+    const candidateSingleCol = joinCols[0] || equalCols[0] || rangeCols[0];
+    if (candidateSingleCol) {
+      const coverage = await isIndexCovered(table, [candidateSingleCol]);
+      if (!coverage.covered) {
+        const idxName = `idx_${table}_${candidateSingleCol}`;
+        singleIndexes.push({
+          tableName: table,
+          columns: [candidateSingleCol],
+          type: "SINGLE",
+          ddl: `CREATE INDEX ${idxName} ON ${table}(${candidateSingleCol});`,
+          rollbackDdl: `DROP INDEX IF EXISTS ${idxName};`,
+        });
+      }
+    }
+
+    // 6b. Kiểm tra đề xuất Composite Index: Thứ tự [Equality] -> [Range]
+    const compositeCols = Array.from(new Set([...equalCols, ...rangeCols]));
+    if (compositeCols.length > 1) {
+      const coverage = await isIndexCovered(table, compositeCols);
+      if (!coverage.covered) {
+        const idxName = `idx_${table}_${compositeCols.join("_")}`;
+        compositeIndexes.push({
+          tableName: table,
+          columns: compositeCols,
+          type: "COMPOSITE",
+          ddl: `CREATE INDEX ${idxName} ON ${table}(${compositeCols.join(", ")});`,
+          rollbackDdl: `DROP INDEX IF EXISTS ${idxName};`,
+        });
       }
     }
   }
 
-  // 5. Xác định câu SQL đề xuất mới
-  const suggestedSql = selectStarRes.rewrittenSql || sql;
+  // 7. STAGE: BUILD OPTIMIZATION CANDIDATES (Hoàn toàn trung lập, không gán Best trước)
+  const candidates = buildOptimizationCandidates({
+    originalSql: cleanSql,
+    rewrittenSql,
+    rewriteReason,
+    singleIndexes,
+    compositeIndexes,
+  });
 
-  // 6. Chạy EXPLAIN ANALYZE trên câu lệnh đề xuất (SAU TỐI ƯU THẬT 100%)
-  const afterMetrics = await executePlanAnalyze(suggestedSql);
-
-  // 7. Tính phần trăm cải thiện
-  const execTimeDiff = beforeMetrics.executionTimeMs - afterMetrics.executionTimeMs;
-  const improvementPercent = beforeMetrics.executionTimeMs > 0
-    ? Math.max(0, Number(((execTimeDiff / beforeMetrics.executionTimeMs) * 100).toFixed(1)))
-    : 0;
-
-  const costDiff = beforeMetrics.totalCost - afterMetrics.totalCost;
-  const reductionPercent = beforeMetrics.totalCost > 0
-    ? Math.max(0, Number(((costDiff / beforeMetrics.totalCost) * 100).toFixed(1)))
-    : 0;
-
-  // 8. Đóng gói danh sách Candidate Queries
-  const candidates: CandidateQuery[] = [
-    {
-      id: "cand-orig",
-      name: "Câu SQL Gốc (Chưa Tối Ưu)",
-      description: "Câu truy vấn ban đầu do người dùng nhập vào.",
-      sql: sql,
-      isBest: false,
-      executionTimeMs: beforeMetrics.executionTimeMs,
-      queryCost: beforeMetrics.totalCost,
-    },
-    {
-      id: "cand-best",
-      name: "Phương án Tối Ưu Nhất (Viết lại SQL + Tạo Index)",
-      description: "Phương án áp dụng toàn bộ các luật tối ưu và Index Scan.",
-      sql: suggestedSql,
-      isBest: true,
-      executionTimeMs: afterMetrics.executionTimeMs,
-      queryCost: afterMetrics.totalCost,
+  // 8. STAGE: CANDIDATE VALIDATOR (Kiểm tra an toàn trước khi đo đạc)
+  const validCandidates = candidates.filter((c) => {
+    const val = validateCandidate(c);
+    if (!val.valid) {
+      console.warn(`[Validator] Bỏ qua candidate ${c.id}:`, val.reason);
     }
-  ];
+    return val.valid;
+  });
+
+  // 9. STAGE: BENCHMARK ENGINE VỚI CANDIDATE ISOLATION
+  // (Mỗi Candidate được: Apply -> Warm-up 1 -> Đo 3 lấy Median -> Rollback về Baseline sạch)
+  for (const cand of validCandidates) {
+    cand.benchmark = await benchmarkCandidateIsolated(cand);
+  }
+
+  // 10. STAGE: COMPARATOR & SCORER (Tính điểm chuẩn hóa và chọn Best Candidate)
+  const baselineCandidate = validCandidates.find((c) => c.id === "cand-baseline") || validCandidates[0];
+  const baselineMetrics = baselineCandidate.benchmark || {
+    executionTimeMs: 100,
+    planningTimeMs: 1,
+    totalCost: estimatedPlanResult.totalCost,
+    sharedHitBlocks: 100,
+    sharedReadBlocks: 100,
+  };
+
+  const comparison = compareCandidates(baselineMetrics, validCandidates);
+  const bestCandidate = comparison.bestCandidate;
+  const bestMetrics = bestCandidate.benchmark || baselineMetrics;
+
+  const timeDiff = Math.max(0, baselineMetrics.executionTimeMs - bestMetrics.executionTimeMs);
+  const improvementPercent = baselineMetrics.executionTimeMs > 0
+    ? Number(((timeDiff / baselineMetrics.executionTimeMs) * 100).toFixed(1))
+    : 0;
+
+  const readDiff = Math.max(0, baselineMetrics.sharedReadBlocks - bestMetrics.sharedReadBlocks);
+  const readReductionPercent = baselineMetrics.sharedReadBlocks > 0
+    ? Number(((readDiff / baselineMetrics.sharedReadBlocks) * 100).toFixed(1))
+    : 0;
+
+  const costDiff = Math.max(0, baselineMetrics.totalCost - bestMetrics.totalCost);
+  const costReductionPercent = baselineMetrics.totalCost > 0
+    ? Number(((costDiff / baselineMetrics.totalCost) * 100).toFixed(1))
+    : 0;
 
   return {
     queryId: "opt-" + Date.now(),
     timestamp: new Date().toISOString(),
     dataset: {
-      name: "e_commerce_db",
+      name: "bigdata_optimizer",
       totalRows: 750000,
     },
-    originalQuery: sql,
-    suggestedQuery: suggestedSql,
-    candidates: candidates,
-    appliedRules: appliedRules.length > 0 ? appliedRules : ["Standard Plan Checking"],
-    bottlenecks: bottlenecks.length > 0 ? bottlenecks : [
-      {
-        id: "bot-0",
-        severity: "low",
-        title: "Chưa phát hiện điểm nghẽn nghiêm trọng",
-        description: "Truy vấn có vẻ ổn định hoặc đã có Index phù hợp.",
-      }
-    ],
-    recommendations: recommendations.length > 0 ? recommendations : [
-      {
-        id: "rec-0",
-        type: "config",
-        action: "Không cần thay đổi",
-        explanation: "Cấu hình truy vấn hiện tại đã đạt hiệu năng phù hợp.",
-      }
-    ],
+    originalQuery: cleanSql,
+    analysis: {
+      columnRoles: queryStructure.columns,
+      tables: queryStructure.tables,
+      hasAggregation: queryStructure.hasAggregation,
+      hasSort: queryStructure.hasSort,
+    },
+    planTree: estimatedPlanResult.planTree,
+    candidates: validCandidates,
+    comparison,
+    bestCandidate,
     metrics: {
-      executionTime: {
-        beforeMs: Number(beforeMetrics.executionTimeMs.toFixed(2)),
-        afterMs: Number(afterMetrics.executionTimeMs.toFixed(2)),
-        improvementPercent: improvementPercent,
-      },
-      queryCost: {
-        before: Number(beforeMetrics.totalCost.toFixed(2)),
-        after: Number(afterMetrics.totalCost.toFixed(2)),
-        reductionPercent: reductionPercent,
-      },
-      bufferReads: {
-        sharedHitsBefore: beforeMetrics.sharedHits,
-        sharedHitsAfter: afterMetrics.sharedHits,
-        sharedReadsBefore: beforeMetrics.sharedReads,
-        sharedReadsAfter: afterMetrics.sharedReads,
-      },
-      planningTime: {
-        beforeMs: Number(beforeMetrics.planningTimeMs.toFixed(2)),
-        afterMs: Number(afterMetrics.planningTimeMs.toFixed(2)),
-      },
+      baseline: baselineMetrics,
+      best: bestMetrics,
+      improvementPercent,
+      readReductionPercent,
+      costReductionPercent,
     },
   };
 }
+
+export { applyCandidateAction, rollbackLatestAction };
