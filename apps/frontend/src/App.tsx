@@ -10,14 +10,18 @@ import {
   RecommendationSection,
 } from './components/AdvisorSections';
 import { BenchmarkCharts } from './components/BenchmarkCharts';
-import { DATASETS, MOCK_OPTIMIZATION, SAMPLE_QUERIES } from './data/mockData';
-import type { OptimizationRule } from './types';
+import { DATASETS, SAMPLE_QUERIES } from './data/mockData';
+import type { OptimizationRule, HistoryItem } from './types';
 import type { Bottleneck, PlanNode, OptimizationResult } from './types';
 import {
   getSamples,
   getDatabaseInfo,
   getDatabaseList,
   switchDatabase,
+  optimizeQuery,
+  applyCandidate,
+  rollbackAction,
+  getHistory,
   type DatabaseOverview,
   type DatabaseItem,
 } from './api/api';
@@ -58,56 +62,82 @@ function convertPlanNode(node: any): PlanNode {
 
 // Helper: extract bottlenecks from backend result
 function extractBottlenecks(result: any): Bottleneck[] {
-  if (result?.bottlenecks && Array.isArray(result.bottlenecks)) return result.bottlenecks;
-  if (result?.analysis?.bottlenecks) return result.analysis.bottlenecks;
-  return MOCK_OPTIMIZATION.bottlenecks;
+  if (result?.bottlenecks && Array.isArray(result.bottlenecks)) {
+    return result.bottlenecks.map((b: any, index: number) => ({
+      id: b.id || `bot-${index}`,
+      severity: b.severity === 'high' ? 'critical' : (b.severity === 'medium' ? 'warning' : 'info'),
+      type: b.title || b.type || 'Điểm nghẽn',
+      message: b.description || b.message || '',
+      table: b.table || b.tableName,
+    }));
+  }
+  return [];
 }
 
+
 // Helper: extract execution plan from backend result
-function extractPlan(result: any): PlanNode {
+function extractPlan(result: any): PlanNode | undefined {
   try {
     if (result?.planTree) return convertPlanNode(result.planTree);
     if (result?.executionPlan) return result.executionPlan;
   } catch {}
-  return MOCK_OPTIMIZATION.executionPlan;
+  return undefined;
 }
 
 // Helper: build OptimizationResult from API response
 function buildOptimizationResult(apiResult: any, originalSql: string): OptimizationResult {
   const best = apiResult?.bestCandidate;
   const bench = best?.benchmark;
-  const origBench = apiResult?.candidates?.[0]?.benchmark;
+  const baseline = apiResult?.metrics?.baseline || apiResult?.candidates?.[0]?.benchmark;
+
+  const originalMetrics = {
+    executionTime: baseline?.executionTimeMs ?? 0,
+    totalCost: baseline?.totalCost ?? 0,
+    sharedReadBuffers: baseline?.sharedReadBlocks ?? 0,
+    sharedHitBuffers: baseline?.sharedHitBlocks ?? 0,
+    planningTime: baseline?.planningTimeMs ?? 0,
+    rowsReturned: baseline?.planRows ?? 0,
+  };
+
+  const optimizedMetrics = {
+    executionTime: bench?.executionTimeMs ?? originalMetrics.executionTime,
+    totalCost: bench?.totalCost ?? originalMetrics.totalCost,
+    sharedReadBuffers: bench?.sharedReadBlocks ?? originalMetrics.sharedReadBuffers,
+    sharedHitBuffers: bench?.sharedHitBlocks ?? originalMetrics.sharedHitBuffers,
+    planningTime: bench?.planningTimeMs ?? originalMetrics.planningTime,
+    rowsReturned: bench?.planRows ?? 0,
+  };
+
+  const improvementPercent = apiResult?.metrics?.improvementPercent
+    ?? apiResult?.comparison?.scores?.[best?.id]?.timeImprovementPercent
+    ?? 0;
 
   return {
     originalQuery: originalSql,
-    optimizedQuery: best?.sql ?? MOCK_OPTIMIZATION.optimizedQuery,
-    originalMetrics: {
-      executionTime: origBench?.executionTimeMs ?? MOCK_OPTIMIZATION.originalMetrics.executionTime,
-      totalCost: origBench?.totalCost ?? MOCK_OPTIMIZATION.originalMetrics.totalCost,
-      sharedReadBuffers: origBench?.sharedReadBlocks ?? MOCK_OPTIMIZATION.originalMetrics.sharedReadBuffers,
-      planningTime: origBench?.planningTimeMs ?? MOCK_OPTIMIZATION.originalMetrics.planningTime,
-      rowsReturned: MOCK_OPTIMIZATION.originalMetrics.rowsReturned,
-    },
-    optimizedMetrics: {
-      executionTime: bench?.executionTimeMs ?? MOCK_OPTIMIZATION.optimizedMetrics.executionTime,
-      totalCost: bench?.totalCost ?? MOCK_OPTIMIZATION.optimizedMetrics.totalCost,
-      sharedReadBuffers: bench?.sharedReadBlocks ?? MOCK_OPTIMIZATION.optimizedMetrics.sharedReadBuffers,
-      planningTime: bench?.planningTimeMs ?? MOCK_OPTIMIZATION.optimizedMetrics.planningTime,
-      rowsReturned: MOCK_OPTIMIZATION.optimizedMetrics.rowsReturned,
-    },
+    optimizedQuery: best?.changes?.find((c: any) => c.sqlCommand)?.sqlCommand || best?.sql || originalSql,
+    originalMetrics,
+    optimizedMetrics,
     bottlenecks: extractBottlenecks(apiResult),
-    executionPlan: extractPlan(apiResult),
-    suggestions: best?.changes?.map((c: any) => c.sqlCommand).filter(Boolean) ?? MOCK_OPTIMIZATION.suggestions,
-    improvementPercent: apiResult?.comparison?.improvementPercent ?? apiResult?.improvementPercent ?? MOCK_OPTIMIZATION.improvementPercent,
+    executionPlan: extractPlan(apiResult)!,
+    suggestions: best?.changes?.map((c: any) => c.sqlCommand).filter(Boolean) || [],
+    improvementPercent,
+    readReductionPercent: apiResult?.metrics?.readReductionPercent ?? 0,
+    costReductionPercent: apiResult?.metrics?.costReductionPercent ?? 0,
+    columnRoles: apiResult?.analysis?.columnRoles || [],
+    candidates: apiResult?.candidates || [],
+    bestCandidate: best,
+    dataset: apiResult?.dataset,
   };
 }
 
 export default function App() {
   const [api, contextHolder] = notification.useNotification();
-  const [selectedDataset, setSelectedDataset] = useState('e_commerce_db');
+  const [selectedDataset, setSelectedDataset] = useState('bigdata_optimizer');
   const [sql, setSql] = useState(SAMPLE_QUERIES[0].sql);
+  const [sampleQueries, setSampleQueries] = useState<Array<{ label: string; sql: string }>>(SAMPLE_QUERIES);
   const [rule, setRule] = useState<OptimizationRule>('all');
   const [loading, setLoading] = useState(false);
+  const [actionLoading, setActionLoading] = useState(false);
   const [result, setResult] = useState<OptimizationResult | null>(null);
 
   // Real DB state
@@ -116,21 +146,59 @@ export default function App() {
   });
   const [dbOverview, setDbOverview] = useState<DatabaseOverview | null>(null);
   const [dbList, setDbList] = useState<DatabaseItem[]>([]);
+  const [historyList, setHistoryList] = useState<HistoryItem[]>([]);
   const [isModalOpen, setIsModalOpen] = useState(false);
-  const [actionMessage, setActionMessage] = useState<string | null>(null);
+  const [modalTab, setModalTab] = useState<"none" | "import" | "connect">("none");
 
   const fetchDatabaseInfo = async () => {
     try {
       const data = await getDatabaseInfo();
       setDbOverview(data);
-      setDbStatus({ connected: true, message: `PostgreSQL 16 – Đã kết nối • ${data.totalRows.toLocaleString()} dòng | ${data.database}` });
+      setSelectedDataset(data.database);
+      setDbStatus({
+        connected: true,
+        message: `PostgreSQL 16 – Đã kết nối • ${data.totalRows.toLocaleString()} dòng | ${data.database}`,
+      });
     } catch {
       setDbStatus({ connected: false, message: 'Không thể kết nối PostgreSQL Database' });
     }
+
     getDatabaseList().then(list => { if (Array.isArray(list)) setDbList(list); }).catch(() => {});
+    
+    // Nạp câu SQL mẫu động theo schema thật
     getSamples().then(res => {
-      // samples loaded but we use built-in SAMPLE_QUERIES for now
+      if (res.success && Array.isArray(res.data) && res.data.length > 0) {
+        const dynamicSamples = res.data.map((s: any) => ({
+          label: s.title || s.label || 'Truy vấn mẫu',
+          sql: s.sql,
+        }));
+        setSampleQueries(dynamicSamples);
+        // Tự động nạp mẫu đầu tiên nếu đang dùng query cũ
+        if (dynamicSamples[0]?.sql) {
+          setSql(dynamicSamples[0].sql);
+        }
+      }
     }).catch(() => {});
+
+    // Nạp lịch sử thao tác thật
+    loadHistory();
+  };
+
+  const loadHistory = async () => {
+    try {
+      const hist = await getHistory();
+      if (Array.isArray(hist)) {
+        setHistoryList(hist.map((h: any) => ({
+          id: String(h.id),
+          timestamp: h.createdAt ? new Date(h.createdAt).toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit' }) : '',
+          query: h.candidateName || 'Tối ưu Index',
+          candidateName: h.candidateName,
+          status: h.status,
+          appliedDdl: h.appliedDdl,
+          rollbackDdl: h.rollbackDdl,
+        })));
+      }
+    } catch {}
   };
 
   useEffect(() => { fetchDatabaseInfo(); }, []);
@@ -138,64 +206,76 @@ export default function App() {
   const handleAnalyze = useCallback(async () => {
     if (!sql.trim()) return;
     setLoading(true);
-    setActionMessage(null);
     try {
-      const res = await fetch('http://localhost:3000/api/optimize', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sql }),
-      });
-      const data = await res.json();
+      const data = await optimizeQuery(sql, rule);
       if (data.success) {
         const optimResult = buildOptimizationResult(data.data, sql);
         setResult(optimResult);
         api.success({
-          message: 'Phân tích hoàn tất',
-          description: `Đã đánh giá ${data.data?.candidates?.length ?? 5} phương án và tìm thấy ứng viên đạt ${optimResult.improvementPercent}% cải thiện.`,
+          message: 'Phân tích & Đo đạc Hoàn Tất',
+          description: `Đã thử nghiệm ${data.data?.candidates?.length ?? 0} phương án. Ứng viên tốt nhất: ${data.data?.bestCandidate?.name || 'Tối ưu'} (${optimResult.improvementPercent}% nhanh hơn).`,
           placement: 'topRight',
           duration: 4,
         });
       } else {
-        api.error({ message: 'Lỗi phân tích', description: data.message || 'Lỗi khi phân tích truy vấn!', placement: 'topRight' });
+        api.error({
+          message: 'Lỗi phân tích',
+          description: data.message || 'Lỗi khi phân tích truy vấn!',
+          placement: 'topRight',
+        });
       }
-    } catch {
-      // Fallback to mock data when backend is unavailable
-      await new Promise(resolve => setTimeout(resolve, 1200));
-      setResult(MOCK_OPTIMIZATION);
-      api.success({
-        message: 'Phân tích hoàn tất (Demo)',
-        description: 'Đã đánh giá 5 phương án và tìm thấy ứng viên đạt 91/100 điểm.',
+    } catch (err: any) {
+      api.error({
+        message: 'Lỗi kết nối máy chủ',
+        description: err.response?.data?.message || err.message || 'Không thể gửi yêu cầu phân tích tới backend.',
         placement: 'topRight',
-        duration: 4,
       });
     } finally {
       setLoading(false);
     }
-  }, [api, sql]);
+  }, [api, sql, rule]);
 
-  const handleApply = async () => {
+  const handleApply = async (candidateToApply: any) => {
+    const target = candidateToApply || result?.bestCandidate;
+    if (!target) return;
+    setActionLoading(true);
     try {
-      const res = await fetch('http://localhost:3000/api/apply', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ candidate: result }),
-      });
-      const data = await res.json();
-      setActionMessage(data.message);
-      api.success({ message: 'Đã áp dụng', description: data.message, placement: 'topRight' });
-    } catch {
-      api.error({ message: 'Lỗi', description: 'Lỗi khi áp dụng phương án!', placement: 'topRight' });
+      const res = await applyCandidate(target);
+      if (res.success) {
+        api.success({
+          message: 'Đã áp dụng thay đổi thành công',
+          description: res.message,
+          placement: 'topRight',
+        });
+        await fetchDatabaseInfo();
+      } else {
+        api.error({ message: 'Lỗi áp dụng', description: res.message, placement: 'topRight' });
+      }
+    } catch (err: any) {
+      api.error({ message: 'Lỗi', description: err.response?.data?.message || err.message, placement: 'topRight' });
+    } finally {
+      setActionLoading(false);
     }
   };
 
   const handleRollback = async () => {
+    setActionLoading(true);
     try {
-      const res = await fetch('http://localhost:3000/api/rollback', { method: 'POST' });
-      const data = await res.json();
-      setActionMessage(data.message);
-      api.success({ message: 'Đã hoàn tác', description: data.message, placement: 'topRight' });
-    } catch {
-      api.warning({ message: 'Hoàn tác', description: 'Thay đổi đã được đưa vào hàng đợi hoàn tác.', placement: 'topRight' });
+      const res = await rollbackAction();
+      if (res.success) {
+        api.success({
+          message: 'Đã hoàn tác thành công',
+          description: res.message,
+          placement: 'topRight',
+        });
+        await fetchDatabaseInfo();
+      } else {
+        api.warning({ message: 'Thông báo', description: res.message, placement: 'topRight' });
+      }
+    } catch (err: any) {
+      api.error({ message: 'Lỗi hoàn tác', description: err.response?.data?.message || err.message, placement: 'topRight' });
+    } finally {
+      setActionLoading(false);
     }
   };
 
@@ -204,9 +284,12 @@ export default function App() {
       const res = await switchDatabase(dbName);
       if (res.success) {
         await fetchDatabaseInfo();
+        setResult(null);
         api.success({ message: `Đã chuyển sang ${dbName}`, placement: 'topRight' });
       }
-    } catch {}
+    } catch (err: any) {
+      api.error({ message: 'Lỗi chuyển CSDL', description: err.message, placement: 'topRight' });
+    }
   };
 
   const datasetsWithDb = dbList.length > 0
@@ -222,8 +305,14 @@ export default function App() {
           selectedDataset={dbOverview?.database ?? selectedDataset}
           onDatasetChange={(v) => { setSelectedDataset(v); handleSwitchDb(v); }}
           onLoadSample={(s) => { setSql(s); setResult(null); }}
-          sampleQueries={SAMPLE_QUERIES}
+          sampleQueries={sampleQueries}
           dbStatus={dbStatus}
+          dbOverview={dbOverview}
+          historyList={historyList}
+          onOpenDataSourceModal={(tab) => {
+            setModalTab(tab || "none");
+            setIsModalOpen(true);
+          }}
         />
         <main className="dashboard-scroll">
           <div className="dashboard-container">
@@ -234,8 +323,8 @@ export default function App() {
               </div>
               <div className="run-meta">
                 <span><i className="status-dot" /> Phiên phân tích trực tiếp</span>
-                <span>{dbOverview ? `${dbOverview.totalRows.toLocaleString()} dòng` : '5,2 triệu dòng'}</span>
-                <span>PostgreSQL 16</span>
+                <span>{dbOverview ? `${dbOverview.totalRows.toLocaleString()} dòng` : '--'}</span>
+                <span>{dbOverview?.database ?? 'PostgreSQL 16'}</span>
               </div>
             </div>
 
@@ -253,7 +342,7 @@ export default function App() {
                   showExpand={false}
                 />
               </div>
-              <BottleneckSummary bottlenecks={result?.bottlenecks ?? MOCK_OPTIMIZATION.bottlenecks} />
+              <BottleneckSummary bottlenecks={result?.bottlenecks} />
             </section>
 
             {/* Benchmark Charts - chỉ hiện khi có kết quả thật */}
@@ -262,7 +351,7 @@ export default function App() {
                 <div className="advisor-heading">
                   <div className="advisor-heading-icon">📊</div>
                   <div>
-                    <div className="advisor-eyebrow">KẾT QUẢ BENCHMARK</div>
+                    <div className="advisor-eyebrow">KẾT QUẢ BENCHMARK THỰC TẾ</div>
                     <h2>So sánh hiệu năng trước & sau tối ưu</h2>
                   </div>
                 </div>
@@ -272,28 +361,40 @@ export default function App() {
                   totalCostBefore={result.originalMetrics.totalCost}
                   totalCostAfter={result.optimizedMetrics.totalCost}
                   improvementPercent={result.improvementPercent}
+                  sharedHitBefore={result.originalMetrics.sharedHitBuffers}
+                  sharedReadBefore={result.originalMetrics.sharedReadBuffers}
+                  sharedHitAfter={result.optimizedMetrics.sharedHitBuffers}
+                  sharedReadAfter={result.optimizedMetrics.sharedReadBuffers}
                 />
               </section>
             )}
 
-            <ExecutionPlanSection plan={result?.executionPlan ?? MOCK_OPTIMIZATION.executionPlan} />
-            <ColumnRolesSection />
-            <CandidateMatrix />
-            <RecommendationSection result={result ?? undefined} />
+            <ExecutionPlanSection plan={result?.executionPlan} />
+            <ColumnRolesSection columns={result?.columnRoles} />
+            <CandidateMatrix candidates={result?.candidates} />
+            {result && (
+              <RecommendationSection
+                result={result}
+                onApply={handleApply}
+                onRollback={handleRollback}
+                loadingAction={actionLoading}
+              />
+            )}
 
             <footer className="dashboard-footer">
-              Kết quả mô phỏng dựa trên EXPLAIN (ANALYZE, BUFFERS) · Cập nhật lần cuối lúc {new Date().toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit' })}
+              Đo đạc thực nghiệm tự động bằng EXPLAIN (ANALYZE, BUFFERS) · CSDL: {dbOverview?.database || 'PostgreSQL'} · Cập nhật lúc {new Date().toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit' })}
             </footer>
           </div>
         </main>
       </div>
 
-      {/* Modal quản lý nguồn dữ liệu */}
+      {/* Modal quản lý nguồn dữ liệu thực tế */}
       <DataSourceModal
         isOpen={isModalOpen}
         onClose={() => setIsModalOpen(false)}
         dbInfo={dbOverview}
         onRefreshDbInfo={fetchDatabaseInfo}
+        initialTab={modalTab}
       />
     </ConfigProvider>
   );

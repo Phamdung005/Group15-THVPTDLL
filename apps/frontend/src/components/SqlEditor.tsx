@@ -1,6 +1,6 @@
 import React, { useRef } from 'react';
 import Editor, { type OnMount } from '@monaco-editor/react';
-import { Button, Select, Tooltip } from 'antd';
+import { Button, Tooltip } from 'antd';
 import { ThunderboltOutlined, ExpandOutlined, CompressOutlined } from '@ant-design/icons';
 import type { OptimizationRule } from '../types';
 
@@ -9,20 +9,12 @@ interface SqlEditorProps {
   onChange: (v: string) => void;
   onAnalyze: () => void;
   loading: boolean;
-  rule: OptimizationRule;
-  onRuleChange: (r: OptimizationRule) => void;
+  rule?: OptimizationRule;
+  onRuleChange?: (r: OptimizationRule) => void;
   expanded: boolean;
   onToggleExpand: () => void;
   showExpand?: boolean;
 }
-
-const RULES: Array<{ label: string; value: OptimizationRule }> = [
-  { label: 'Tất cả quy tắc', value: 'all' },
-  { label: 'Đẩy Index xuống (Index Pushdown)', value: 'index_pushdown' },
-  { label: 'Sắp xếp lại JOIN', value: 'join_reorder' },
-  { label: 'Cắt tỉa phân vùng', value: 'partition_pruning' },
-  { label: 'Nội tuyến hóa CTE', value: 'cte_inline' },
-];
 
 const EDITOR_THEME = {
   base: 'vs-dark' as const,
@@ -51,7 +43,7 @@ const EDITOR_THEME = {
   },
 };
 
-export function SqlEditor({ value, onChange, onAnalyze, loading, rule, onRuleChange, expanded, onToggleExpand, showExpand = true }: SqlEditorProps) {
+export function SqlEditor({ value, onChange, onAnalyze, loading, expanded, onToggleExpand, showExpand = true }: SqlEditorProps) {
   const editorRef = useRef<Parameters<OnMount>[0] | null>(null);
 
   const handleMount: OnMount = (editor, monaco) => {
@@ -75,15 +67,6 @@ export function SqlEditor({ value, onChange, onAnalyze, loading, rule, onRuleCha
           </div>
         </div>
         <div className="flex items-center gap-2">
-          <Select
-            value={rule}
-            onChange={onRuleChange}
-            size="small"
-            options={RULES}
-            style={{ width: 220 }}
-            className="rule-select"
-            popupClassName="dark-select-popup"
-          />
           {showExpand && <Tooltip title={expanded ? 'Thu nhỏ editor' : 'Mở rộng editor'}>
             <Button
               size="small"

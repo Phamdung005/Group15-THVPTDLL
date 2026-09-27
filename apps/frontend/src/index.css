@@ -1,7 +1,8 @@
-﻿@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
 @import 'tailwindcss';
+@import './modal.css';
 
-/* â”€â”€ Base â”€â”€ */
+/* ── Base ── */
 *, *::before, *::after { box-sizing: border-box; }
 
 html, body, #root {
@@ -475,8 +476,10 @@ body {
 
 .bottleneck-row.critical { box-shadow: inset 2px 0 #f43f5e; }
 .bottleneck-row.warning { box-shadow: inset 2px 0 #f59e0b; }
+.bottleneck-row.info { box-shadow: inset 2px 0 #06b6d4; }
 .bottleneck-state { padding-top: 1px; color: #fb7185; font-size: 13px; }
 .bottleneck-row.warning .bottleneck-state { color: #fbbf24; }
+.bottleneck-row.info .bottleneck-state { color: #06b6d4; }
 .bottleneck-copy { min-width: 0; }
 .bottleneck-copy strong { color: #e2e8f0; font-size: 11px; font-weight: 650; }
 .bottleneck-copy code {
