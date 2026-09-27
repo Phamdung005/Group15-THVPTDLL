@@ -308,7 +308,6 @@ export default function App() {
           sampleQueries={sampleQueries}
           dbStatus={dbStatus}
           dbOverview={dbOverview}
-          historyList={historyList}
           onOpenDataSourceModal={(tab) => {
             setModalTab(tab || "none");
             setIsModalOpen(true);

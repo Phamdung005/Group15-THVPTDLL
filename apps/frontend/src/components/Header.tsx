@@ -5,13 +5,12 @@ import {
   CloudServerOutlined,
   DatabaseOutlined,
   CodeOutlined,
-  HistoryOutlined,
   DownOutlined,
   SafetyCertificateOutlined,
   CheckCircleFilled,
   UploadOutlined,
 } from '@ant-design/icons';
-import type { Dataset, HistoryItem } from '../types';
+import type { Dataset } from '../types';
 import type { DatabaseOverview } from '../api/api';
 
 interface HeaderProps {
@@ -22,7 +21,6 @@ interface HeaderProps {
   sampleQueries: Array<{ label: string; sql: string }>;
   dbStatus?: { connected: boolean; message: string };
   dbOverview?: DatabaseOverview | null;
-  historyList?: HistoryItem[];
   onOpenDataSourceModal: (tab?: "none" | "import" | "connect") => void;
 }
 
@@ -34,7 +32,6 @@ export function Header({
   sampleQueries,
   dbStatus,
   dbOverview,
-  historyList = [],
   onOpenDataSourceModal,
 }: HeaderProps) {
   const [sourceOpen, setSourceOpen] = useState(false);
@@ -46,26 +43,6 @@ export function Header({
     label: <span className="font-mono text-xs">{q.label}</span>,
     onClick: () => onLoadSample(q.sql),
   }));
-
-  const historyItems = historyList.length > 0 ? historyList.map(h => ({
-    key: h.id,
-    label: (
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-        <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 11, color: '#e2e8f0' }}>
-          {h.query || h.candidateName || 'Tối ưu Index'}
-        </span>
-        <span style={{ fontSize: 9, color: '#64748b' }}>
-          {h.timestamp} · {h.status === 'APPLIED' ? '✅ Đã áp dụng' : (h.status === 'ROLLED_BACK' ? '↩️ Đã hoàn tác' : `↑${h.improvement ?? 0}%`)}
-        </span>
-      </div>
-    ),
-  })) : [
-    {
-      key: 'empty-history',
-      label: <span className="text-xs text-slate-400">Chưa có lịch sử thao tác</span>,
-      disabled: true,
-    }
-  ];
 
   const sourcePanel = (
     <div style={{ width: 320 }}>
@@ -183,12 +160,6 @@ export function Header({
         <Dropdown menu={{ items: sampleItems }} trigger={['click']} overlayClassName="dark-dropdown">
           <Button size="small" icon={<CodeOutlined />} className="header-btn">
             Câu SQL Mẫu <DownOutlined className="text-xs" />
-          </Button>
-        </Dropdown>
-
-        <Dropdown menu={{ items: historyItems }} trigger={['click']} overlayClassName="dark-dropdown">
-          <Button size="small" icon={<HistoryOutlined />} className="header-btn">
-            Lịch Sử <DownOutlined className="text-xs" />
           </Button>
         </Dropdown>
       </div>
