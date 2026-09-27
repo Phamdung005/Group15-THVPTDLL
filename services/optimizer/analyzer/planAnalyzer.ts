@@ -16,7 +16,7 @@ export interface PlanNode {
 }
 
 export interface PlanBottleneckNode {
-  type: "SEQ_SCAN" | "NESTED_LOOP" | "SORT_DISK" | "HASH_AGGREGATE";
+  type: "SEQ_SCAN" | "FULL_SCAN_AGGREGATION" | "NESTED_LOOP" | "SORT_DISK" | "HASH_AGGREGATE";
   tableName?: string;
   cost: number;
   description: string;
@@ -57,13 +57,17 @@ export async function getEstimatedPlan(sql: string): Promise<EstimatedPlanResult
 
     if (nodeType === "Seq Scan" && relName) {
       seqScanTables.push(relName.toLowerCase());
+      const hasFilter = Boolean(node["Filter"]);
       bottlenecks.push({
-        type: "SEQ_SCAN",
+        type: hasFilter ? "SEQ_SCAN" : "FULL_SCAN_AGGREGATION",
         tableName: relName.toLowerCase(),
         cost: node["Total Cost"] || 0,
-        description: `Quét toàn bộ bảng \`${relName}\` do thiếu Index hoặc Planner không chọn Index.`,
+        description: hasFilter
+          ? `Quét toàn bộ bảng \`${relName}\` do thiếu Index ở điều kiện lọc (${node["Filter"]}). CSDL phải duyệt từng dòng trên đĩa.`
+          : `Quét toàn bộ bảng \`${relName}\` để tổng hợp 100% dữ liệu. PostgreSQL chủ động chọn Sequential Scan để tối ưu I/O tuần tự.`,
       });
     }
+
 
     if (nodeType === "Nested Loop" && (node["Plan Rows"] > 1000 || node["Total Cost"] > 5000)) {
       bottlenecks.push({

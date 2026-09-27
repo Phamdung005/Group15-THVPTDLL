@@ -143,3 +143,30 @@ export async function rollbackLatestAction(): Promise<{ success: boolean; messag
     };
   }
 }
+
+/**
+ * Lấy danh sách lịch sử các thao tác tối ưu gần nhất
+ */
+export async function getOptimizationHistory(): Promise<HistoryRecord[]> {
+  await initHistoryTable();
+  try {
+    const res = await pool.query(`
+      SELECT 
+        id, 
+        candidate_id AS "candidateId", 
+        candidate_name AS "candidateName", 
+        applied_ddl AS "appliedDdl", 
+        rollback_ddl AS "rollbackDdl", 
+        status, 
+        created_at AS "createdAt"
+      FROM optimization_history
+      ORDER BY id DESC
+      LIMIT 20;
+    `);
+    return res.rows;
+  } catch (err: any) {
+    console.warn("[HistoryService] Lỗi khi lấy lịch sử:", err.message);
+    return [];
+  }
+}
+

@@ -19,30 +19,54 @@ export function calculateCandidateScore(
   candidateBenchmark: BenchmarkMetrics,
   candidate: OptimizationCandidate
 ): CandidateScore {
-  const baseTime = Math.max(0.01, baseline.executionTimeMs);
-  const baseReads = Math.max(1, baseline.sharedReadBlocks);
-  const baseCost = Math.max(1, baseline.totalCost);
+  const baseTime = baseline.executionTimeMs;
+  const candTime = candidateBenchmark.executionTimeMs;
 
-  // 1. Chuẩn hóa tỷ lệ cải thiện (0% đến 100%)
-  const timeDiff = Math.max(0, baseTime - candidateBenchmark.executionTimeMs);
-  const timeImprovementPercent = Number(((timeDiff / baseTime) * 100).toFixed(1));
+  // 1. Đối với Baseline: Điểm cải thiện cơ sở là 0
+  if (candidate.id === "cand-baseline") {
+    return {
+      candidateId: candidate.id,
+      timeImprovementPercent: 0,
+      readReductionPercent: 0,
+      costReductionPercent: 0,
+      totalScore: 0,
+    };
+  }
 
-  const readDiff = Math.max(0, baseReads - candidateBenchmark.sharedReadBlocks);
-  const readReductionPercent = Number(((readDiff / baseReads) * 100).toFixed(1));
+  // 2. Tính % cải thiện thời gian thực thi:
+  // Nếu chậm hơn baseline (candTime > baseTime), giá trị là số âm
+  let timeImprovementPercent = 0;
+  if (baseTime > 0) {
+    timeImprovementPercent = Number((((baseTime - candTime) / baseTime) * 100).toFixed(1));
+  }
 
-  const costDiff = Math.max(0, baseCost - candidateBenchmark.totalCost);
-  const costReductionPercent = Number(((costDiff / baseCost) * 100).toFixed(1));
+  // 3. Tính % cải thiện đọc đĩa (I/O Blocks):
+  // CHỈ tính khi baseline thực sự có đọc đĩa (> 0). Nếu cả hai đều đọc 0 block từ đĩa thì cải thiện là 0%.
+  let readReductionPercent = 0;
+  if (baseline.sharedReadBlocks > 0) {
+    const readDiff = baseline.sharedReadBlocks - candidateBenchmark.sharedReadBlocks;
+    readReductionPercent = Number(((readDiff / baseline.sharedReadBlocks) * 100).toFixed(1));
+  }
 
-  // 2. Chi phí overhead ghi khi tạo thêm Index (tránh tạo index vô tội vạ)
+  // 4. Tính % cải thiện chi phí lập kế hoạch (Cost):
+  let costReductionPercent = 0;
+  if (baseline.totalCost > 0) {
+    const costDiff = baseline.totalCost - candidateBenchmark.totalCost;
+    costReductionPercent = Number(((costDiff / baseline.totalCost) * 100).toFixed(1));
+  }
+
+  // 5. Chi phí phạt khi tạo thêm Index (tránh tạo index thừa không cần thiết):
+  // Mỗi index tạo mới bị phạt 1.5 điểm
   const indexCount = candidate.changes.filter((c) => c.type === "CREATE_INDEX").length;
-  const indexOverheadPenalty = indexCount * 2.0;
+  const indexOverheadPenalty = indexCount * 1.5;
 
-  // 3. Tổng điểm chuẩn hóa
+  // 6. Tổng điểm chuẩn hóa:
+  // 60% Thời gian, 25% Đọc đĩa I/O, 15% Chi phí planner - Phạt Index
   const totalScore = Number(
     (
-      0.5 * timeImprovementPercent +
-      0.3 * readReductionPercent +
-      0.2 * costReductionPercent -
+      0.6 * timeImprovementPercent +
+      0.25 * readReductionPercent +
+      0.15 * costReductionPercent -
       indexOverheadPenalty
     ).toFixed(2)
   );
@@ -52,6 +76,7 @@ export function calculateCandidateScore(
     timeImprovementPercent,
     readReductionPercent,
     costReductionPercent,
-    totalScore: Math.max(0, totalScore),
+    totalScore,
   };
 }
+

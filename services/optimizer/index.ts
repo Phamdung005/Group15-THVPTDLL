@@ -4,6 +4,8 @@ import { analyzeColumnRoles, AnalyzedColumn } from "./analyzer/columnRoleAnalyze
 import { isIndexCovered } from "./analyzer/schemaAnalyzer";
 import { checkSelectStarRule } from "./rules/selectStarRule";
 import { checkFunctionOnColumnRule } from "./rules/functionColumnRule";
+import { checkJoinRule } from "./rules/joinRule";
+import { checkPartitionRule } from "./rules/partitionRule";
 import {
   buildOptimizationCandidates,
   OptimizationCandidate,
@@ -12,7 +14,11 @@ import {
 import { validateCandidate } from "./optimizer/candidateValidator";
 import { benchmarkCandidateIsolated } from "./benchmark/executor";
 import { compareCandidates, ComparisonResult } from "./benchmark/comparator";
-import { applyCandidateAction, rollbackLatestAction } from "./history/historyService";
+import {
+  applyCandidateAction,
+  rollbackLatestAction,
+  getOptimizationHistory,
+} from "./history/historyService";
 
 export interface BottleneckItem {
   id: string;
@@ -45,6 +51,7 @@ export interface OptimizationResponseDTO {
     hasAggregation: boolean;
     hasSort: boolean;
   };
+  bottlenecks: BottleneckItem[];
   planTree: PlanNode;
   candidates: OptimizationCandidate[];
   comparison: ComparisonResult;
@@ -63,7 +70,10 @@ export type OptimizationResponse = OptimizationResponseDTO;
 /**
  * MASTER ORCHESTRATOR: Plan-Driven Optimization Advisor & Candidate Optimizer
  */
-export async function analyzeAndOptimizeSQL(sql: string): Promise<OptimizationResponseDTO> {
+export async function analyzeAndOptimizeSQL(
+  sql: string,
+  rule: string = "all"
+): Promise<OptimizationResponseDTO> {
   const cleanSql = sql.trim();
 
   // 1. STAGE: SECURITY CHECK (Chỉ cho phép SELECT / EXPLAIN, chặn toàn bộ lệnh ghi DML/DDL)
@@ -168,16 +178,45 @@ export async function analyzeAndOptimizeSQL(sql: string): Promise<OptimizationRe
         });
       }
     }
+
+    // 6c. Kiểm tra đề xuất Covering Index (INCLUDE) cho bảng có JOIN và AGGREGATE
+    const aggCols = queryStructure.columns
+      .filter((c) => c.tableName === table && c.role === "AGGREGATE")
+      .map((c) => c.columnName);
+
+    if (candidateSingleCol && aggCols.length > 0) {
+      const idxName = `idx_${table}_cov_${candidateSingleCol}`;
+      const ddl = `CREATE INDEX ${idxName} ON ${table}(${candidateSingleCol}) INCLUDE (${aggCols.join(", ")});`;
+      compositeIndexes.push({
+        tableName: table,
+        columns: [candidateSingleCol, ...aggCols],
+        type: "COMPOSITE",
+        ddl,
+        rollbackDdl: `DROP INDEX IF EXISTS ${idxName};`,
+      });
+    }
   }
 
+
   // 7. STAGE: BUILD OPTIMIZATION CANDIDATES (Hoàn toàn trung lập, không gán Best trước)
-  const candidates = buildOptimizationCandidates({
+  let candidates = buildOptimizationCandidates({
     originalSql: cleanSql,
     rewrittenSql,
     rewriteReason,
     singleIndexes,
     compositeIndexes,
   });
+
+  // Lọc Candidates theo Rule nếu người dùng chọn cụ thể
+  if (rule === "index_pushdown") {
+    candidates = candidates.filter((c) =>
+      ["BASELINE", "SINGLE_INDEX", "COMPOSITE_INDEX"].includes(c.strategy)
+    );
+  } else if (rule === "cte_inline" || rule === "join_reorder") {
+    candidates = candidates.filter((c) =>
+      ["BASELINE", "REWRITE", "COMBINED"].includes(c.strategy)
+    );
+  }
 
   // 8. STAGE: CANDIDATE VALIDATOR (Kiểm tra an toàn trước khi đo đạc)
   const validCandidates = candidates.filter((c) => {
@@ -197,11 +236,11 @@ export async function analyzeAndOptimizeSQL(sql: string): Promise<OptimizationRe
   // 10. STAGE: COMPARATOR & SCORER (Tính điểm chuẩn hóa và chọn Best Candidate)
   const baselineCandidate = validCandidates.find((c) => c.id === "cand-baseline") || validCandidates[0];
   const baselineMetrics = baselineCandidate.benchmark || {
-    executionTimeMs: 100,
-    planningTimeMs: 1,
+    executionTimeMs: 0,
+    planningTimeMs: 0,
     totalCost: estimatedPlanResult.totalCost,
-    sharedHitBlocks: 100,
-    sharedReadBlocks: 100,
+    sharedHitBlocks: 0,
+    sharedReadBlocks: 0,
   };
 
   const comparison = compareCandidates(baselineMetrics, validCandidates);
@@ -223,12 +262,74 @@ export async function analyzeAndOptimizeSQL(sql: string): Promise<OptimizationRe
     ? Number(((costDiff / baselineMetrics.totalCost) * 100).toFixed(1))
     : 0;
 
+  // Lấy metadata động của Database đang hoạt động
+  let currentDbName = "bigdata_optimizer";
+  let totalDbRows = 0;
+  try {
+    const dbRes = await pool.query("SELECT current_database() AS db_name;");
+    currentDbName = dbRes.rows[0]?.db_name || currentDbName;
+    const rowRes = await pool.query("SELECT COALESCE(SUM(n_live_tup), 0) AS total_rows FROM pg_stat_user_tables;");
+    totalDbRows = Number(rowRes.rows[0]?.total_rows || 0);
+  } catch {}
+
+  // 11. STAGE: THU THẬP TẤT CẢ ĐIỂM NGHẼN (BOTTLENECKS)
+  const bottlenecks: BottleneckItem[] = [];
+
+  // a. Điểm nghẽn từ SELECT *
+  if (selectStarRes.bottleneck) {
+    bottlenecks.push(selectStarRes.bottleneck);
+  }
+
+  // b. Điểm nghẽn từ hàm trên cột (Non-sargable function)
+  if (funcRes.bottleneck) {
+    bottlenecks.push(funcRes.bottleneck);
+  }
+
+  // c. Điểm nghẽn từ phép JOIN
+  const joinRes = checkJoinRule(cleanSql);
+  if (joinRes.bottleneck) {
+    bottlenecks.push(joinRes.bottleneck);
+  }
+
+  // d. Điểm nghẽn từ Cây kế hoạch (Seq Scan, Nested Loop, Sort Disk)
+  for (const b of estimatedPlanResult.bottlenecks) {
+    if (b.type === "FULL_SCAN_AGGREGATION") {
+      bottlenecks.push({
+        id: `bot-plan-fullscan-${b.tableName || "node"}`,
+        severity: "low",
+        title: `Quét Khối Tuần Tự (Seq Scan) tổng hợp trên \`${b.tableName}\``,
+        description: b.description,
+        table: b.tableName,
+        suggestedFix: "Do câu lệnh tính toán trên 100% dữ liệu không có WHERE, CSDL dùng Sequential Scan để tối đa tốc độ đọc I/O. Với Big Data cực lớn, giải pháp là dùng Materialized View hoặc Covering Index.",
+      });
+    } else {
+      bottlenecks.push({
+        id: `bot-plan-${b.type.toLowerCase()}-${b.tableName || "node"}`,
+        severity: b.type === "SEQ_SCAN" ? "high" : "medium",
+        title: b.type === "SEQ_SCAN"
+          ? `Quét Toàn Bảng do thiếu Index trên \`${b.tableName}\``
+          : (b.type === "NESTED_LOOP" ? "Vòng lặp lồng (Nested Loop) chi phí cao" : "Thao tác sắp xếp tràn ra đĩa (Sort Disk)"),
+        description: b.description,
+        table: b.tableName,
+      });
+    }
+  }
+
+
+  // e. Điểm nghẽn từ quy mô bảng lớn
+  for (const table of queryStructure.tables) {
+    const partRes = checkPartitionRule(totalDbRows, table);
+    if (partRes.bottleneck) {
+      bottlenecks.push(partRes.bottleneck);
+    }
+  }
+
   return {
     queryId: "opt-" + Date.now(),
     timestamp: new Date().toISOString(),
     dataset: {
-      name: "bigdata_optimizer",
-      totalRows: 750000,
+      name: currentDbName,
+      totalRows: totalDbRows,
     },
     originalQuery: cleanSql,
     analysis: {
@@ -237,6 +338,7 @@ export async function analyzeAndOptimizeSQL(sql: string): Promise<OptimizationRe
       hasAggregation: queryStructure.hasAggregation,
       hasSort: queryStructure.hasSort,
     },
+    bottlenecks,
     planTree: estimatedPlanResult.planTree,
     candidates: validCandidates,
     comparison,
@@ -251,4 +353,6 @@ export async function analyzeAndOptimizeSQL(sql: string): Promise<OptimizationRe
   };
 }
 
-export { applyCandidateAction, rollbackLatestAction };
+
+export { applyCandidateAction, rollbackLatestAction, getOptimizationHistory };
+
