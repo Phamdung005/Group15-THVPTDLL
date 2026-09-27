@@ -4,7 +4,13 @@ import path from "path";
 import fs from "fs";
 import multer from "multer";
 import { pool, switchDatabasePool, testDbConnection, currentDbConfig } from "./db";
-import { analyzeAndOptimizeSQL, applyCandidateAction, rollbackLatestAction } from "../../../services/optimizer/index";
+import {
+  analyzeAndOptimizeSQL,
+  applyCandidateAction,
+  rollbackLatestAction,
+  getOptimizationHistory,
+} from "../../../services/optimizer/index";
+
 import {
   getDatabaseOverview,
   listAvailableDatabases,
@@ -127,6 +133,7 @@ app.post("/api/dataset/upload", upload.single("file"), async (req, res) => {
   const delimiter = req.body.delimiter || ",";
   const createNewDb = req.body.createNewDb === "true" || req.body.createNewDb === true;
   const targetDbName = req.body.targetDbName;
+  const overwrite = req.body.overwrite !== "false" && req.body.overwrite !== false;
 
   try {
     // Nếu người dùng chọn tạo hẳn CSDL mới độc lập cho dataset này
@@ -138,8 +145,8 @@ app.post("/api/dataset/upload", upload.single("file"), async (req, res) => {
     let result: any;
     if (originalName.endsWith(".sql")) {
       result = await executeSqlFile(filePath);
-    } else if (originalName.endsWith(".csv") || originalName.endsWith(".txt")) {
-      result = await importCsvFile(filePath, tableName, delimiter);
+    } else if (originalName.endsWith(".csv") || originalName.endsWith(".txt") || originalName.endsWith(".tsv")) {
+      result = await importCsvFile(filePath, tableName, delimiter, overwrite);
     } else {
       throw new Error("Định dạng file không hỗ trợ. Vui lòng tải lên file .sql hoặc .csv.");
     }
@@ -190,14 +197,14 @@ app.post("/api/dataset/generate", async (req, res) => {
 
 // 6. API Phân Tích & Tối Ưu Truy Vấn SQL
 app.post("/api/optimize", async (req, res) => {
-  const { sql } = req.body;
+  const { sql, rule } = req.body;
   if (!sql || typeof sql !== "string") {
     res.status(400).json({ success: false, message: "Vui lòng nhập câu lệnh SQL hợp lệ." });
     return;
   }
 
   try {
-    const result = await analyzeAndOptimizeSQL(sql);
+    const result = await analyzeAndOptimizeSQL(sql, rule || "all");
     res.json({ success: true, data: result });
   } catch (error: any) {
     res.status(500).json({
@@ -233,6 +240,19 @@ app.get("/api/samples", async (_req, res) => {
     res.json({
       success: true,
       data: samples,
+    });
+  } catch (error: any) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// 10. API Lấy lịch sử tối ưu và hoàn tác thực tế từ PostgreSQL
+app.get("/api/history", async (_req, res) => {
+  try {
+    const history = await getOptimizationHistory();
+    res.json({
+      success: true,
+      data: history,
     });
   } catch (error: any) {
     res.status(500).json({ success: false, message: error.message });

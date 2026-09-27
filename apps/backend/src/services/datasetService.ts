@@ -154,10 +154,38 @@ export async function listAvailableDatabases(): Promise<DatabaseListItem[]> {
 }
 
 /**
+ * Helper parse một dòng CSV chuẩn RFC 4180 (hỗ trợ dấu phẩy trong ngoặc kép và escaped quotes)
+ */
+function parseCsvRow(line: string, delimiter: string = ","): string[] {
+  const fields: string[] = [];
+  let current = "";
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (c === '"') {
+      if (inQuotes && line[i + 1] === '"') {
+        current += '"';
+        i++; // skip escaped quote
+      } else {
+        inQuotes = !inQuotes;
+      }
+    } else if (c === delimiter && !inQuotes) {
+      fields.push(current.trim().replace(/^["']|["']$/g, ""));
+      current = "";
+    } else {
+      current += c;
+    }
+  }
+  fields.push(current.trim().replace(/^["']|["']$/g, ""));
+  return fields;
+}
+
+/**
  * Tạo một database mới trên PostgreSQL server nếu chưa có
  */
 export async function createNewDatabase(dbName: string): Promise<string> {
-  const safeDb = dbName.toLowerCase().replace(/[^a-z0-9_]/g, "_");
+  let safeDb = dbName.toLowerCase().replace(/[^a-z0-9_]/g, "_");
+  if (!safeDb || safeDb === "_") safeDb = `db_${Date.now().toString(36)}`;
   const check = await pool.query("SELECT 1 FROM pg_database WHERE datname = $1", [safeDb]);
   if (check.rows.length === 0) {
     await pool.query(`CREATE DATABASE "${safeDb}";`);
@@ -166,66 +194,141 @@ export async function createNewDatabase(dbName: string): Promise<string> {
 }
 
 /**
- * Thực thi file .SQL do người dùng tải lên
+ * Thực thi file .SQL do người dùng tải lên với cơ chế làm sạch và bỏ qua lệnh không tương thích
  */
 export async function executeSqlFile(filePath: string): Promise<{ success: boolean; message: string; statementsExecuted: number }> {
-  const content = fs.readFileSync(filePath, "utf-8");
+  let content = fs.readFileSync(filePath, "utf-8");
+  if (content.charCodeAt(0) === 0xFEFF) {
+    content = content.slice(1); // Xóa UTF-8 BOM
+  }
   if (!content.trim()) {
     throw new Error("File SQL rỗng.");
   }
 
-  // Chạy câu lệnh SQL trong transaction
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN;");
-    await client.query(content);
-    await client.query("COMMIT;");
+  // 1. Loại bỏ các dòng lệnh psql (\c, \connect, \i, etc.) và comment dòng
+  const cleanedLines = content
+    .split(/\r?\n/)
+    .filter((line) => {
+      const trimmed = line.trim();
+      return !trimmed.startsWith("\\") && !trimmed.startsWith("--");
+    });
+  let cleanContent = cleanedLines.join("\n");
 
-    // Thu thập lại thống kê sau khi nạp DDL/DML
-    await client.query("ANALYZE;");
+  // 2. Tự động tương thích các cú pháp MySQL thường gặp trong dump
+  cleanContent = cleanContent
+    .replace(/ENGINE\s*=\s*\w+/gi, "")
+    .replace(/AUTO_INCREMENT\s*=\s*\d+/gi, "")
+    .replace(/AUTO_INCREMENT/gi, "")
+    .replace(/COLLATE\s*=\s*[\w_]+/gi, "")
+    .replace(/COLLATE\s+[\w_]+/gi, "")
+    .replace(/\bint\(\d+\)/gi, "INT")
+    .replace(/\btinyint\(\d+\)/gi, "SMALLINT")
+    .replace(/\bdatetime\b/gi, "TIMESTAMP");
+
+  // 3. Tách các câu lệnh theo dấu chấm phẩy
+  const rawStatements = cleanContent
+    .split(";")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+
+  const client = await pool.connect();
+  let executedCount = 0;
+  const errors: string[] = [];
+
+  try {
+    for (const stmt of rawStatements) {
+      const upper = stmt.toUpperCase();
+      // Bỏ qua các lệnh USE database hoặc LOCK TABLES
+      if (upper.startsWith("USE ") || upper.startsWith("LOCK TABLES") || upper.startsWith("UNLOCK TABLES")) {
+        continue;
+      }
+
+      try {
+        await client.query(stmt + ";");
+        executedCount++;
+      } catch (stmtErr: any) {
+        // Bỏ qua lỗi DROP TABLE khi bảng chưa tồn tại
+        if (upper.startsWith("DROP ") && stmtErr.message.includes("does not exist")) {
+          continue;
+        }
+        console.warn(`[executeSqlFile] Warning on statement: ${stmt.slice(0, 80)}... Error: ${stmtErr.message}`);
+        errors.push(stmtErr.message);
+      }
+    }
+
+    try {
+      await client.query("ANALYZE;");
+    } catch {}
+
+    if (executedCount === 0 && errors.length > 0) {
+      throw new Error(`Không thể thực thi câu lệnh SQL nào: ${errors[0]}`);
+    }
+
     return {
       success: true,
-      message: "Đã nạp và thực thi file SQL thành công vào cơ sở dữ liệu!",
-      statementsExecuted: content.split(";").filter((s) => s.trim().length > 0).length,
+      message: `Đã nạp và thực thi thành công ${executedCount} câu lệnh SQL vào CSDL!${errors.length > 0 ? ` (Đã bỏ qua ${errors.length} câu lệnh không tương thích)` : ""}`,
+      statementsExecuted: executedCount,
     };
-  } catch (err: any) {
-    await client.query("ROLLBACK;");
-    throw new Error(`Lỗi khi thực thi file SQL: ${err.message}`);
   } finally {
     client.release();
   }
 }
 
 /**
- * Nạp file CSV vào bảng mục tiêu trong PostgreSQL
+ * Nạp file CSV vào bảng mục tiêu trong PostgreSQL (chuẩn RFC 4180, xử lý BOM, unique cột, batch an toàn)
  */
 export async function importCsvFile(
   filePath: string,
   tableName: string,
-  delimiter: string = ","
+  delimiter: string = ",",
+  overwrite: boolean = true
 ): Promise<{ success: boolean; message: string; rowsImported: number }> {
-  const content = fs.readFileSync(filePath, "utf-8");
+  let content = fs.readFileSync(filePath, "utf-8");
+  if (content.charCodeAt(0) === 0xFEFF) {
+    content = content.slice(1); // Xóa UTF-8 BOM
+  }
   const lines = content.split(/\r?\n/).filter((l) => l.trim().length > 0);
 
   if (lines.length < 2) {
     throw new Error("File CSV cần ít nhất một dòng tiêu đề (header) và một dòng dữ liệu.");
   }
 
-  const rawHeaders = lines[0].split(delimiter).map((h) => h.trim().replace(/^["']|["']$/g, ""));
-  const cleanHeaders = rawHeaders.map((h, i) => (h ? h.toLowerCase().replace(/[^a-z0-9_]/g, "_") : `col_${i + 1}`));
-  const safeTable = tableName.toLowerCase().replace(/[^a-z0-9_]/g, "_");
+  // Parse dòng headers chuẩn
+  const rawHeaders = parseCsvRow(lines[0], delimiter);
+  const seenHeaders = new Map<string, number>();
+  const cleanHeaders: string[] = [];
+
+  for (let i = 0; i < rawHeaders.length; i++) {
+    let h = rawHeaders[i].toLowerCase().replace(/[^a-z0-9_]/g, "_");
+    if (!h || h === "_") h = `col_${i + 1}`;
+    if (seenHeaders.has(h)) {
+      const count = seenHeaders.get(h)! + 1;
+      seenHeaders.set(h, count);
+      h = `${h}_${count}`;
+    } else {
+      seenHeaders.set(h, 1);
+    }
+    cleanHeaders.push(h);
+  }
+
+  let safeTable = tableName.toLowerCase().replace(/[^a-z0-9_]/g, "_");
+  if (!safeTable || safeTable === "_") safeTable = "imported_dataset";
 
   const client = await pool.connect();
   try {
-    await client.query("BEGIN;");
+    if (overwrite) {
+      await client.query(`DROP TABLE IF EXISTS "${safeTable}" CASCADE;`);
+    }
 
-    // Tạo bảng nếu chưa tồn tại (mặc định kiểu TEXT cho an toàn)
+    // Tạo bảng (mặc định kiểu TEXT để tương thích 100% mọi kiểu dữ liệu)
     const colDefs = cleanHeaders.map((h) => `"${h}" TEXT`).join(", ");
     await client.query(`CREATE TABLE IF NOT EXISTS "${safeTable}" (${colDefs});`);
 
     // Batch insert dữ liệu
     const dataLines = lines.slice(1);
-    const BATCH_SIZE = 500;
+    const numCols = cleanHeaders.length;
+    // Đảm bảo không vượt quá giới hạn 65535 tham số của prepared statement
+    const BATCH_SIZE = Math.max(1, Math.min(500, Math.floor(60000 / numCols)));
     let totalImported = 0;
 
     for (let i = 0; i < dataLines.length; i += BATCH_SIZE) {
@@ -235,10 +338,9 @@ export async function importCsvFile(
       let paramIdx = 1;
 
       for (const line of chunk) {
-        const values = line.split(delimiter).map((v) => v.trim().replace(/^["']|["']$/g, ""));
-        // Đảm bảo đủ số cột
-        while (values.length < cleanHeaders.length) values.push("");
-        const rowParams = values.slice(0, cleanHeaders.length).map((val) => {
+        const values = parseCsvRow(line, delimiter);
+        while (values.length < numCols) values.push("");
+        const rowParams = values.slice(0, numCols).map((val) => {
           params.push(val);
           return `$${paramIdx++}`;
         });
@@ -255,17 +357,15 @@ export async function importCsvFile(
       }
     }
 
-    await client.query("COMMIT;");
     await client.query(`ANALYZE "${safeTable}";`);
 
     return {
       success: true,
-      message: `Đã nạp thành công ${totalImported} dòng vào bảng "${safeTable}"!`,
+      message: `Đã nạp thành công ${totalImported.toLocaleString()} dòng vào bảng "${safeTable}"!`,
       rowsImported: totalImported,
     };
   } catch (err: any) {
-    await client.query("ROLLBACK;");
-    throw new Error(`Lỗi khi nạp CSV vào bảng ${safeTable}: ${err.message}`);
+    throw new Error(`Lỗi khi nạp CSV vào bảng "${safeTable}": ${err.message}`);
   } finally {
     client.release();
   }
