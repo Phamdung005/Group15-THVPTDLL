@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import {
   type DatabaseOverview,
   connectDatabase,
@@ -11,6 +11,7 @@ interface DataSourceModalProps {
   onClose: () => void;
   dbInfo: DatabaseOverview | null;
   onRefreshDbInfo: () => void;
+  initialTab?: "none" | "import" | "connect";
 }
 
 export const DataSourceModal: React.FC<DataSourceModalProps> = ({
@@ -18,6 +19,7 @@ export const DataSourceModal: React.FC<DataSourceModalProps> = ({
   onClose,
   dbInfo,
   onRefreshDbInfo,
+  initialTab = "none",
 }) => {
   const [activeTab, setActiveTab] = useState<"none" | "import" | "connect">("none");
   const [loading, setLoading] = useState(false);
@@ -36,13 +38,51 @@ export const DataSourceModal: React.FC<DataSourceModalProps> = ({
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [tableName, setTableName] = useState("");
   const [delimiter, setDelimiter] = useState(",");
-  const [destMode, setDestMode] = useState<"current" | "new">("current");
+  const [destMode, setDestMode] = useState<"current" | "new">("new");
   const [targetDbName, setTargetDbName] = useState("");
+  const [overwrite, setOverwrite] = useState(true);
+  const [isDragging, setIsDragging] = useState(false);
 
   // Chi tiết danh sách bảng
   const [showTableList, setShowTableList] = useState(false);
 
+  useEffect(() => {
+    if (isOpen) {
+      if (initialTab && initialTab !== "none") {
+        setActiveTab(initialTab);
+      }
+      setStatusMessage(null);
+    }
+  }, [isOpen, initialTab]);
+
   if (!isOpen) return null;
+
+  // Xử lý kéo thả file trực tiếp
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragging(true);
+  };
+
+  const handleDragLeave = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragging(false);
+  };
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragging(false);
+    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
+      const file = e.dataTransfer.files[0];
+      setSelectedFile(file);
+      const nameWithoutExt = file.name.replace(/\.[^/.]+$/, "");
+      const safeName = nameWithoutExt.toLowerCase().replace(/[^a-z0-9_]/g, "_");
+      setTableName(safeName);
+      setTargetDbName(`${safeName}_db`);
+    }
+  };
 
   // Xử lý kiểm tra kết nối DB
   const handleTestConnection = async () => {
@@ -105,7 +145,8 @@ export const DataSourceModal: React.FC<DataSourceModalProps> = ({
         tableName || undefined,
         delimiter,
         destMode === "new",
-        destMode === "new" ? targetDbName : undefined
+        destMode === "new" ? targetDbName : undefined,
+        overwrite
       );
       setStatusMessage({ type: "success", text: `🎉 ${res.message}` });
       setSelectedFile(null);
@@ -257,16 +298,24 @@ export const DataSourceModal: React.FC<DataSourceModalProps> = ({
           <div className="tab-content-panel">
             <h4 className="tab-subtitle">1. TẢI FILE DỮ LIỆU TỪ MÁY TÍNH (.CSV / .SQL)</h4>
             <form onSubmit={handleUploadFile} className="upload-form">
-              <div className="file-drop-area">
+              <div
+                className={`file-drop-area ${isDragging ? "is-dragging" : ""}`}
+                onDragOver={handleDragOver}
+                onDragLeave={handleDragLeave}
+                onDrop={handleDrop}
+              >
                 <input
                   type="file"
                   id="dataset-file-input"
-                  accept=".csv,.sql,.txt"
+                  accept=".csv,.sql,.txt,.tsv"
                   onChange={(e) => {
                     if (e.target.files && e.target.files[0]) {
-                      setSelectedFile(e.target.files[0]);
-                      const nameWithoutExt = e.target.files[0].name.replace(/\.[^/.]+$/, "");
-                      setTableName(nameWithoutExt);
+                      const file = e.target.files[0];
+                      setSelectedFile(file);
+                      const nameWithoutExt = file.name.replace(/\.[^/.]+$/, "");
+                      const safeName = nameWithoutExt.toLowerCase().replace(/[^a-z0-9_]/g, "_");
+                      setTableName(safeName);
+                      setTargetDbName(`${safeName}_db`);
                     }
                   }}
                 />
@@ -275,17 +324,18 @@ export const DataSourceModal: React.FC<DataSourceModalProps> = ({
                   {selectedFile ? (
                     <div className="file-chosen-info">
                       <strong>{selectedFile.name}</strong> ({(selectedFile.size / 1024 / 1024).toFixed(2)} MB)
+                      <div className="text-xs text-cyan-400 mt-1">Đã sẵn sàng tải lên</div>
                     </div>
                   ) : (
                     <div>
                       <strong>Nhấp để chọn file</strong> hoặc kéo thả file .csv, .sql vào đây
-                      <div className="drop-hint">Hỗ trợ tối đa 100MB cho mỗi file</div>
+                      <div className="drop-hint">Hỗ trợ tối đa 100MB (.csv, .sql, .txt, .tsv)</div>
                     </div>
                   )}
                 </label>
               </div>
 
-              {selectedFile && selectedFile.name.endsWith(".csv") && (
+              {selectedFile && /\.(csv|txt|tsv)$/i.test(selectedFile.name) && (
                 <div className="csv-options-grid">
                   <div className="form-group">
                     <label>Tên bảng lưu dữ liệu:</label>
@@ -293,7 +343,7 @@ export const DataSourceModal: React.FC<DataSourceModalProps> = ({
                       type="text"
                       className="form-input"
                       value={tableName}
-                      onChange={(e) => setTableName(e.target.value)}
+                      onChange={(e) => setTableName(e.target.value.toLowerCase().replace(/[^a-z0-9_]/g, "_"))}
                       placeholder="ví dụ: my_sales_data"
                       required
                     />
@@ -319,16 +369,7 @@ export const DataSourceModal: React.FC<DataSourceModalProps> = ({
                     Nơi lưu trữ dữ liệu nạp vào:
                   </label>
                   <div style={{ display: "flex", flexDirection: "column", gap: "10px", fontSize: "13px" }}>
-                    <label style={{ display: "flex", alignItems: "center", gap: "8px", cursor: "pointer", color: "#cbd5e1" }}>
-                      <input
-                        type="radio"
-                        name="destMode"
-                        checked={destMode === "current"}
-                        onChange={() => setDestMode("current")}
-                      />
-                      <span>Nạp thành bảng trong CSDL đang chọn (<code>{dbInfo?.database}</code>)</span>
-                    </label>
-                    <label style={{ display: "flex", alignItems: "center", gap: "8px", cursor: "pointer", color: "#cbd5e1" }}>
+                    <label style={{ display: "flex", alignItems: "center", gap: "8px", cursor: "pointer", color: "#67e8f9", fontWeight: 600 }}>
                       <input
                         type="radio"
                         name="destMode"
@@ -336,6 +377,15 @@ export const DataSourceModal: React.FC<DataSourceModalProps> = ({
                         onChange={() => setDestMode("new")}
                       />
                       <span>Tạo hẳn một CSDL mới độc lập (Hiển thị ngay trên Dropdown Header)</span>
+                    </label>
+                    <label style={{ display: "flex", alignItems: "center", gap: "8px", cursor: "pointer", color: "#94a3b8" }}>
+                      <input
+                        type="radio"
+                        name="destMode"
+                        checked={destMode === "current"}
+                        onChange={() => setDestMode("current")}
+                      />
+                      <span>Nạp thành bảng phụ bên trong CSDL hiện tại (<code>{dbInfo?.database}</code>)</span>
                     </label>
                   </div>
                   {destMode === "new" && (
@@ -347,10 +397,23 @@ export const DataSourceModal: React.FC<DataSourceModalProps> = ({
                         type="text"
                         className="form-input"
                         value={targetDbName}
-                        onChange={(e) => setTargetDbName(e.target.value)}
+                        onChange={(e) => setTargetDbName(e.target.value.toLowerCase().replace(/[^a-z0-9_]/g, "_"))}
                         placeholder="ví dụ: pokemon_db, custom_dataset_db..."
                         required={destMode === "new"}
                       />
+                    </div>
+                  )}
+
+                  {selectedFile && /\.(csv|txt|tsv)$/i.test(selectedFile.name) && (
+                    <div style={{ marginTop: "12px", paddingTop: "10px", borderTop: "1px solid #334155/60" }}>
+                      <label style={{ display: "flex", alignItems: "center", gap: "8px", cursor: "pointer", fontSize: "12px", color: "#94a3b8" }}>
+                        <input
+                          type="checkbox"
+                          checked={overwrite}
+                          onChange={(e) => setOverwrite(e.target.checked)}
+                        />
+                        <span>Tự động tạo mới/ghi đè nếu bảng đã tồn tại (khuyên dùng)</span>
+                      </label>
                     </div>
                   )}
                 </div>

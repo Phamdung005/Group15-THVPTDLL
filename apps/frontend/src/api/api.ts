@@ -39,9 +39,14 @@ export const checkHealth = async () => {
   return res.data;
 };
 
-export const optimizeQuery = async (sql: string) => {
-  const response = await apiClient.post("/optimize", { sql });
+export const optimizeQuery = async (sql: string, rule: string = "all") => {
+  const response = await apiClient.post("/optimize", { sql, rule });
   return response.data;
+};
+
+export const getHistory = async (): Promise<any[]> => {
+  const res = await apiClient.get("/history");
+  return res.data.data || [];
 };
 
 export const getSamples = async () => {
@@ -58,6 +63,7 @@ export const getDatabaseList = async (): Promise<DatabaseItem[]> => {
   const res = await apiClient.get("/database/list");
   return res.data.data;
 };
+
 
 export const switchDatabase = async (databaseName: string) => {
   const res = await apiClient.post("/database/connect", {
@@ -84,7 +90,8 @@ export const uploadDatasetFile = async (
   tableName?: string,
   delimiter: string = ",",
   createNewDb: boolean = false,
-  targetDbName?: string
+  targetDbName?: string,
+  overwrite: boolean = true
 ) => {
   const formData = new FormData();
   formData.append("file", file);
@@ -92,6 +99,7 @@ export const uploadDatasetFile = async (
   formData.append("delimiter", delimiter);
   if (createNewDb) formData.append("createNewDb", "true");
   if (targetDbName) formData.append("targetDbName", targetDbName);
+  formData.append("overwrite", overwrite ? "true" : "false");
 
   const res = await axios.post(`${API_URL}/dataset/upload`, formData, {
     headers: { "Content-Type": "multipart/form-data" },
